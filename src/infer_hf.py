@@ -22,7 +22,7 @@ from tqdm.auto import tqdm
 from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
 from utils import parse_answers, normalize_label, extract_json
-from prompt import build_baseline_prompt, build_cot_prompt
+from prompt import build_baseline_prompt, build_cot_prompt, parse_answer
 
 PROMPT_BUILDERS = {
     "baseline": build_baseline_prompt,
@@ -43,18 +43,28 @@ def parse_args():
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--output-path", default="./outputs/")
     p.add_argument("--run-name", default=None)
+    p.add_argument("--lora-dir", default=None, help="LoRA 체크포인트 경로")
+    p.add_argument("--start-from", type=int, default=0, help="이어서 추론할 시작 행 인덱스")
     return p.parse_args()
 
 
-def load_model(model_id: str):
+def load_model(model_id: str, lora_dir: str = None):
     use_cuda = torch.cuda.is_available()
-    dtype = torch.float16 if use_cuda else torch.float32
+    if use_cuda:
+        cap = torch.cuda.get_device_capability()
+        dtype = torch.bfloat16 if cap[0] >= 8 else torch.float16
+    else:
+        dtype = torch.float32
     processor = LlavaOnevisionProcessor.from_pretrained(model_id)
     model = LlavaOnevisionForConditionalGeneration.from_pretrained(
         model_id,
         torch_dtype=dtype,
         device_map="auto" if use_cuda else None,
     )
+    if lora_dir and Path(lora_dir).exists():
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, lora_dir)
+        print(f"LoRA loaded: {lora_dir}")
     if not use_cuda:
         model = model.to("cpu")
     model.eval()
@@ -116,16 +126,27 @@ def main():
     df["model_output"] = None
     df["label"] = None
 
+    df["model_output"] = None
+    df["label"] = None
+
     build_prompt_text = PROMPT_BUILDERS[args.prompt_type]
 
     print(f"Loading model: {args.model_id}")
-    model, processor = load_model(args.model_id)
+    model, processor = load_model(args.model_id, lora_dir=args.lora_dir)
     print(f"Model loaded. Device: {next(model.parameters()).device}")
 
     save_every = 50
 
-    with tqdm(total=len(df), desc="Inference", unit="sample") as pbar:
-        for row_idx, row in df.iterrows():
+    # 이어서 추론: start_from 이전 결과를 기존 detail CSV에서 복원
+    if args.start_from > 0 and os.path.exists(detail_csv):
+        prev = pd.read_csv(detail_csv)
+        for col in ["model_output", "label"]:
+            if col in prev.columns:
+                df.loc[:args.start_from - 1, col] = prev.loc[:args.start_from - 1, col].values
+        print(f"이어서 추론: row {args.start_from}부터 (이전 {args.start_from}개 복원)")
+
+    with tqdm(total=len(df), desc="Inference", unit="sample", initial=args.start_from) as pbar:
+        for row_idx, row in df.iloc[args.start_from:].iterrows():
             image_path = Path(args.images_dir) / str(row["image_path"])
             img = load_image(image_path, args.img_size)
 
@@ -145,12 +166,19 @@ def main():
             try:
                 text = run_one(model, processor, img, prompt_text, args.max_new_tokens)
                 df.at[row_idx, "model_output"] = text
-                parsed = extract_json(text)
-                df.at[row_idx, "label"] = normalize_label(parsed.get("answer_id"))
             except Exception as e:
-                print(f"[row {row_idx}] error: {e}")
+                print(f"[row {row_idx}] run_one error: {e}")
                 df.at[row_idx, "label"] = "0"
                 df.at[row_idx, "model_output"] = ""
+                pbar.update(1)
+                continue
+            try:
+                answers_list = parse_answers(row["answers"])
+                label = parse_answer(text, answers_list)
+                df.at[row_idx, "label"] = str(label)
+            except Exception as e:
+                print(f"[row {row_idx}] parse error: {e} | output={text[:80]}")
+                df.at[row_idx, "label"] = normalize_label(text)
 
             if (pbar.n + 1) % save_every == 0 or row_idx == df.index[-1]:
                 _save(df, out_csv, detail_csv)

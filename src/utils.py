@@ -31,12 +31,28 @@ def normalize_label(value) -> str:
     if value is None:
         return "0"
     s = str(value).strip()
-    return s if s in {"0", "1", "2"} else "0"
+    if s in {"0", "1", "2"}:
+        return s
+    for c in reversed(s):
+        if c in "012":
+            return c
+    return "0"
 
 
 def extract_json(text: str) -> dict:
+    """하위호환용. 신규 코드는 prompt.parse_answer 사용 권장."""
+    if not text:
+        return {}
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
-        return json.loads(text[start : end + 1])
-    return json.loads(text)
+        try:
+            result = json.loads(text[start : end + 1])
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, ValueError):
+            pass
+    for c in reversed(text.strip()):
+        if c in "012":
+            return {"answer_id": c}
+    return {}
