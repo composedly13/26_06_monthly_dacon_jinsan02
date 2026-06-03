@@ -1,7 +1,0 @@
-model_id: llava-hf/llava-onevision-qwen2-0.5b-si-hf
-prompt_type: cot
-batch_size: 8
-img_size: 512
-max_tokens: 512
-temperature: 0.0
-seed: 42
