@@ -43,10 +43,14 @@ def parse_args():
     p.add_argument("--max-pixels",  type=int, default=200704)   # ~448×448
     p.add_argument("--min-pixels",  type=int, default=50176)    # ~224×224
     p.add_argument("--no-image",    action="store_true")
+    p.add_argument("--use-4bit",    action="store_true",
+                   help="4-bit 양자화 (T4 등 VRAM ≤16GB 환경, bitsandbytes 필요)")
+    p.add_argument("--start-from",  type=int, default=0,
+                   help="이어서 추론할 시작 행 인덱스")
     return p.parse_args()
 
 
-def load_model(model_id: str, max_pixels: int, min_pixels: int):
+def load_model(model_id: str, max_pixels: int, min_pixels: int, use_4bit: bool = False):
     use_cuda = torch.cuda.is_available()
     cap = torch.cuda.get_device_capability() if use_cuda else (0, 0)
     dtype = torch.bfloat16 if cap[0] >= 8 else (torch.float16 if use_cuda else torch.float32)
@@ -66,11 +70,21 @@ def load_model(model_id: str, max_pixels: int, min_pixels: int):
         ip.max_pixels = max_pixels
         ip.min_pixels = min_pixels
 
-    print(f"Loading model ({dtype}) ...")
-    model = AutoModelForImageTextToText.from_pretrained(
-        load_path, dtype=dtype, device_map=device,
-        attn_implementation="sdpa",
-    ).eval()
+    model_kwargs = dict(device_map="auto" if use_cuda else None, attn_implementation="sdpa")
+    if use_4bit:
+        from transformers import BitsAndBytesConfig
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        print(f"Loading model (4-bit NF4, compute={dtype}) ...")
+    else:
+        model_kwargs["dtype"] = dtype
+        print(f"Loading model ({dtype}) ...")
+
+    model = AutoModelForImageTextToText.from_pretrained(load_path, **model_kwargs).eval()
     print(f"Model loaded on {device}.")
     return model, processor
 
@@ -119,9 +133,9 @@ def main():
     df = pd.read_csv(args.data_csv)
     if args.max_samples:
         df = df.head(args.max_samples).copy()
-    print(f"{len(df)} rows | batch={args.batch_size} | model={args.model_id}")
+    print(f"{len(df)} rows | batch={args.batch_size} | model={args.model_id} | 4bit={args.use_4bit}")
 
-    model, processor = load_model(args.model_id, args.max_pixels, args.min_pixels)
+    model, processor = load_model(args.model_id, args.max_pixels, args.min_pixels, args.use_4bit)
     tok = getattr(processor, "tokenizer", None)
     pad_id = (tok.pad_token_id if tok and tok.pad_token_id is not None
               else (tok.eos_token_id if tok else None))
@@ -134,6 +148,18 @@ def main():
     rows = df.to_dict("records")
     device = next(model.parameters()).device
     t0 = time.time()
+
+    # 이어서 추론: start_from 이전 결과 복원
+    if args.start_from > 0 and os.path.exists(detail_csv):
+        prev = pd.read_csv(detail_csv)
+        n_restore = min(args.start_from, len(prev))
+        for i in range(n_restore):
+            lbl = prev.iloc[i].get("label", None)
+            raw = prev.iloc[i].get("_raw", "")
+            preds.append(int(lbl) if pd.notna(lbl) else 0)
+            raws.append(str(raw) if pd.notna(raw) else "")
+        rows = rows[n_restore:]
+        print(f"이어서 추론: {n_restore}개 복원, {len(rows)}개 남음")
 
     with torch.inference_mode():
         for s in tqdm(range(0, len(rows), args.batch_size), desc="Inference", unit="batch"):
