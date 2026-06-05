@@ -54,6 +54,10 @@ _ANSWER_PAT = re.compile(r"answer\s*[:\-]?\s*\**\s*([012])", re.IGNORECASE)
 _DIGIT_PAT  = re.compile(r"\b([012])\b")
 # v2 포맷: [Logic] 라인 뒤 Answer: 패턴도 지원
 _LOGIC_ANSWER_PAT = re.compile(r"\[Logic\].*?Answer\s*:\s*([012])", re.IGNORECASE | re.DOTALL)
+# v3 사후 보정: [Textual]과 [Logic] 양쪽이 모두 "증거 없음"일 때만 Unknown으로 교정
+# → [Textual]에 실제 증거가 있으면 보정 발동 안 함
+_TEXTUAL_NO_EV_PAT = re.compile(r'\[Textual\]\s*No direct evidence', re.IGNORECASE)
+_LOGIC_INSUF_PAT   = re.compile(r'\[Logic\]\s*Insufficient evidence', re.IGNORECASE)
 
 
 def find_unknown_index(options: list[str]) -> int:
@@ -69,31 +73,49 @@ def find_unknown_index(options: list[str]) -> int:
 def parse_answer(text: str, options: list[str], fallback_to_unknown: bool = True) -> int:
     """모델 출력 텍스트에서 0/1/2 추출.
     우선순위: Answer: X → [Logic]...Answer: X → 마지막 단독 숫자 → 옵션 텍스트 매칭 → unknown 폴백
+
+    v3 사후 보정: [Textual]과 [Logic] 양쪽에서 "No direct evidence / Insufficient evidence"가
+    감지되면 Answer가 0/1이어도 Unknown으로 보정 (모순 출력 수정).
     """
+    result = None
+
     if text:
         # 1순위: "Answer: X" 패턴 (v1·v2 공통)
         m = list(_ANSWER_PAT.finditer(text))
         if m:
-            return int(m[-1].group(1))
+            result = int(m[-1].group(1))
         # 2순위: [Logic] 블록 내 Answer (v2 구조화 포맷)
-        m2 = _LOGIC_ANSWER_PAT.search(text)
-        if m2:
-            return int(m2.group(1))
+        if result is None:
+            m2 = _LOGIC_ANSWER_PAT.search(text)
+            if m2:
+                result = int(m2.group(1))
         # 3순위: 텍스트 마지막 단독 숫자
-        d = list(_DIGIT_PAT.finditer(text))
-        if d:
-            return int(d[-1].group(1))
+        if result is None:
+            d = list(_DIGIT_PAT.finditer(text))
+            if d:
+                result = int(d[-1].group(1))
         # 4순위: 옵션 텍스트가 출력에 포함된 경우
-        low = text.lower()
-        for i, o in enumerate(options):
-            if o.lower() in low:
-                return i
+        if result is None:
+            low = text.lower()
+            for i, o in enumerate(options):
+                if o.lower() in low:
+                    result = i
+                    break
+
+        # v3 사후 보정: [Textual]="No direct evidence" AND [Logic]="Insufficient evidence" 둘 다일 때만
+        # Answer가 0/1이면 Unknown으로 교정 (실제 텍스트 증거가 있으면 발동 안 함)
+        if result in (0, 1) and fallback_to_unknown:
+            if _TEXTUAL_NO_EV_PAT.search(text) and _LOGIC_INSUF_PAT.search(text):
+                u = find_unknown_index(options)
+                if u >= 0:
+                    result = u
+
     # 5순위: unknown 옵션으로 폴백
-    if fallback_to_unknown:
+    if result is None and fallback_to_unknown:
         u = find_unknown_index(options)
         if u >= 0:
             return u
-    return 0
+    return result if result is not None else 0
 
 
 # ── 프롬프트 빌더 ──────────────────────────────────────────────────────────────
